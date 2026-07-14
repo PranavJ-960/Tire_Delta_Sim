@@ -1,14 +1,10 @@
-"""
-Usage:
-    python data_pipeline.py --year 2024 --country Italy   # pull data first
-    python explore.py --year 2024 --country Italy         # then explore it
-"""
-
 import argparse
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# Historical fallback used only when telemetry cannot identify a fuel effect.
+FUEL_EFFECT_PER_LAP = -0.035
 
 def load_race(year: int, country: str, data_dir: str = "data") -> dict:
     race_dir = os.path.join(data_dir, f"{year}_{country.replace(' ', '_')}")
@@ -19,24 +15,38 @@ def load_race(year: int, country: str, data_dir: str = "data") -> dict:
         "weather": pd.read_csv(os.path.join(race_dir, "weather.csv")),
     }
 
-
 def clean_laps(laps: pd.DataFrame) -> pd.DataFrame:
     """
-    Drop laps that will wreck a degradation fit: in/out laps, laps under
-    safety car (no lap-time reliability), and missing lap times.
+    Centralized data cleaning layer. Drops laps that wreck degradation fits:
+    missing lap durations, pit entry/exit laps, safety car windows, and non-green periods.
     """
+    if laps.empty:
+        return laps.copy()
+    
     df = laps.copy()
     df = df.dropna(subset=["lap_duration"])
-    if "is_pit_out_lap" in df.columns:
-        df = df[df["is_pit_out_lap"] == False]  # noqa: E712
+    
+    # Modern boolean flags
+    for col in ("is_pit_out_lap", "is_pit_in_lap"):
+        if col in df.columns:
+            df = df[df[col] == False]
+
+    # Handle abnormal race control operational conditions
+    if "track_status" in df.columns:
+        df = df[df["track_status"].astype(str).str.strip() == "1"]
+    elif "lap_status" in df.columns:
+        df = df[df["lap_status"].astype(str).str.lower() == "valid"]
+        
+    for column in ("is_safety_car", "is_virtual_safety_car", "is_vsc"):
+        if column in df.columns:
+            df = df[df[column] != True]
+            
     return df
 
-
 def attach_tire_age(laps: pd.DataFrame, stints: pd.DataFrame) -> pd.DataFrame:
-    """
-    Join each lap to the tire stint it belongs to, so every lap has a
-    compound + tire age (laps since that tire was fitted).
-    """
+    if laps.empty or stints.empty:
+        raise ValueError("Critical Telemetry Loss: Empty datasets passed to pipeline.")
+        
     rows = []
     for _, stint in stints.iterrows():
         mask = (
@@ -45,25 +55,22 @@ def attach_tire_age(laps: pd.DataFrame, stints: pd.DataFrame) -> pd.DataFrame:
             & (laps["lap_number"] <= stint["lap_end"])
         )
         chunk = laps[mask].copy()
+        if chunk.empty:
+            continue
+            
+        # Fixed Point 3: Fallback boundary checks for NaN starting ages
+        start_age = stint["tyre_age_at_start"] if pd.notna(stint["tyre_age_at_start"]) else 0
+        
         chunk["compound"] = stint["compound"]
-        chunk["tire_age"] = chunk["lap_number"] - stint["lap_start"] + stint["tyre_age_at_start"]
+        chunk["tire_age"] = chunk["lap_number"] - stint["lap_start"] + start_age
         rows.append(chunk)
-    return pd.concat(rows, ignore_index=True) if rows else laps
-
+        
+    if not rows:
+        raise RuntimeError("Stint Realignment Failed: No valid compound allocations resolved.")
+    return pd.concat(rows, ignore_index=True)
 
 def fit_degradation(laps_with_tires: pd.DataFrame):
-    """
-    Very simple per-compound degradation: median lap time by tire age.
-    Good enough for a first pass — swap for a linear/poly fit once you
-    trust the data.
-    """
-    summary = (
-        laps_with_tires.groupby(["compound", "tire_age"])["lap_duration"]
-        .median()
-        .reset_index()
-    )
-    return summary
-
+    return laps_with_tires.groupby(["compound", "tire_age"])["lap_duration"].median().reset_index()
 
 def plot_degradation(summary: pd.DataFrame, out_path: str = "degradation.png"):
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -75,8 +82,7 @@ def plot_degradation(summary: pd.DataFrame, out_path: str = "degradation.png"):
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path)
-    print(f"Saved chart to {out_path}")
-
+    plt.close(fig)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -88,14 +94,5 @@ if __name__ == "__main__":
     laps = clean_laps(race["laps"])
     laps_with_tires = attach_tire_age(laps, race["stints"])
 
-    print(f"Loaded {len(laps_with_tires)} clean laps across "
-          f"{laps_with_tires['compound'].nunique()} compounds.")
-
     summary = fit_degradation(laps_with_tires)
-    print("\nMedian lap time by compound + tire age (first 15 rows):")
     print(summary.head(15).to_string(index=False))
-
-    plot_degradation(summary)
-
-    print(f"\nActual pit stops this race: {len(race['pits'])}")
-    print(race["pits"][["driver_number", "lap_number", "pit_duration"]].to_string(index=False))
