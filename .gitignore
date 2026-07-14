@@ -1,0 +1,18 @@
+# Data pulled from OpenF1 — regenerate with data_pipeline.py / season_pull.py
+data/
+
+# Generated charts
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env vars (not needed for OpenF1, but here in case I add a keyed API later)
+.env
+
+# OS / editor cruft
+.DS_Store
+.vscode/
