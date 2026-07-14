@@ -120,15 +120,24 @@ def optimize_strategy(total_laps: int, models: dict, pit_loss: float) -> dict:
     return {"strategy": best_strategy, "total_time": best_time}
 
 
-def reconstruct_actual_strategy(stints_df: pd.DataFrame, driver_number: int) -> list:
+def reconstruct_actual_strategy(stints_df: pd.DataFrame, driver_number: int, total_laps: int) -> list:
     """
     Extracts a driver's historical stints from stints.csv and formats them into
     the standard strategy list structure [(compound, end_lap), ...] expected by the simulator.
+    Gracefully handles DNFs and missing data by filling NaN lap ends.
     """
-    driver_stints = (
-        stints_df[stints_df["driver_number"] == driver_number]
-        .sort_values("lap_start")
-    )
+    driver_stints = stints_df[stints_df["driver_number"] == driver_number].copy()
+    
+    if driver_stints.empty:
+        return []
+
+    # Clean missing values: If compound is missing, drop it. 
+    # If lap_end is missing (DNF), cap it at the total race laps or drop if invalid.
+    driver_stints = driver_stints.dropna(subset=["compound"])
+    driver_stints["lap_end"] = driver_stints["lap_end"].fillna(total_laps)
+    
+    driver_stints = driver_stints.sort_values("lap_start")
+    
     return [(str(row["compound"]).upper(), int(row["lap_end"])) for _, row in driver_stints.iterrows()]
 
 
@@ -140,7 +149,8 @@ def compare_driver_to_optimal(
     Reconstructs a real driver's race timeline, executes it inside our mathematical 
     degradation framework, and calculates the variance relative to the absolute optimum.
     """
-    actual_strategy = reconstruct_actual_strategy(stints_df, driver_number)
+    # FIX: Pass total_laps down to handle DNF rows safely
+    actual_strategy = reconstruct_actual_strategy(stints_df, driver_number, total_laps)
     if not actual_strategy:
         return None
         
