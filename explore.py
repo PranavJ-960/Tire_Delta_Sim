@@ -1,7 +1,4 @@
 """
-Day 1-2 exploration script: sanity-check the pulled data and fit a first,
-very rough tire degradation model.
-
 Usage:
     python data_pipeline.py --year 2024 --country Italy   # pull data first
     python explore.py --year 2024 --country Italy         # then explore it

@@ -1,10 +1,6 @@
 """
 Pull an entire season's worth of races, reusing data_pipeline.get_race_data().
 
-This is the "just loop it" step from our conversation — same function,
-called once per race, so degradation/pit-loss numbers stay race-specific
-while the code stays identical.
-
 Usage:
     python season_pull.py --year 2024
 """
