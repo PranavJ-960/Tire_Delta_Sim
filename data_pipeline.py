@@ -54,7 +54,7 @@ def find_race_session(year: int, country: str) -> dict:
 
 
 def get_laps(session_key: int) -> pd.DataFrame:
-    """Lap-by-lap data: lap time, driver, lap number."""
+    """Lap-by-lap data: lap time, driver, lap number, date_start."""
     data = _get("laps", {"session_key": session_key})
     return pd.DataFrame(data)
 

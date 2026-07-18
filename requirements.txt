@@ -2,5 +2,3 @@ requests
 pandas
 matplotlib
 streamlit
-pytest
-scipy

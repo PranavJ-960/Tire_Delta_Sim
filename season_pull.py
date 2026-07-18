@@ -20,7 +20,6 @@ def list_race_countries(year: int) -> list:
     )
     resp.raise_for_status()
     sessions = resp.json()
-    # dedupe while preserving order
     seen = set()
     countries = []
     for s in sessions:

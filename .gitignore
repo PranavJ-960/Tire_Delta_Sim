@@ -10,7 +10,7 @@ __pycache__/
 .venv/
 venv/
 
-# Env vars (not needed for OpenF1, but here in case I add a keyed API later)
+# Env vars (not needed for OpenF1, but here in case you add a keyed API later)
 .env
 
 # OS / editor cruft
