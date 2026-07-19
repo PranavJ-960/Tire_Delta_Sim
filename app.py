@@ -24,6 +24,7 @@ from optimizer import (
     DRY_COMPOUNDS,
     WET_COMPOUNDS,
 )
+from season_priors import load_season_priors
 
 st.set_page_config(page_title="F1 Pit Strategy Simulator", layout="wide")
 st.title("🏎️ F1 Pit Strategy Simulator")
@@ -41,8 +42,9 @@ def get_race_context(year: int, country: str):
     total_laps = int(race["laps"]["lap_number"].max())
     pit_loss = compute_pit_loss(race["pits"])
     lap_weather = build_lap_weather(race["laps"], race["weather"])
-    models = fit_degradation_models(laps_with_tires)
-    return race, laps_with_tires, total_laps, pit_loss, lap_weather, models
+    season_priors = load_season_priors(year)
+    models = fit_degradation_models(laps_with_tires, season_priors=season_priors)
+    return race, laps_with_tires, total_laps, pit_loss, lap_weather, models, season_priors is not None
 
 
 @st.cache_data
@@ -75,8 +77,16 @@ choice = st.sidebar.selectbox("Choose a Grand Prix", labels)
 year_str, country_str = choice.split(" ", 1)
 year, country = int(year_str), country_str
 
-race, laps_with_tires, total_laps, pit_loss, lap_weather, models = get_race_context(year, country)
+race, laps_with_tires, total_laps, pit_loss, lap_weather, models, has_season_priors = get_race_context(year, country)
 optimal = get_optimal(total_laps, models, pit_loss, lap_weather)
+
+if not has_season_priors:
+    st.caption(
+        "⚠️ No season priors found for this year — compounds with no laps "
+        "this race are excluded from the optimizer rather than estimated. "
+        "Run `python season_priors.py --year " + str(year) + "` after pulling "
+        "more races from this season to improve coverage."
+    )
 
 # --- Top metrics ---
 col1, col2, col3 = st.columns(3)

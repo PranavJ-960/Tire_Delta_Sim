@@ -29,12 +29,19 @@ WRONG_TIRE_PENALTY_SEC = 15.0
 def compute_pit_loss(pits_df: pd.DataFrame) -> float:
     """
     Typical time lost to a pit stop, in seconds. OpenF1's pit_duration is
-    time spent stationary in the pit box — NOT the full pit-lane time loss
-    (which also includes the speed-limited drive through the lane and the
-    time lost relative to staying flat-out on track). We add a fixed
-    estimate for that lane-transit cost on top of the stationary time.
+    time spent stationary in the pit box, not the full pit-lane loss
+    (entry, speed-limited transit, exit, versus staying flat-out on track).
+
+    KNOWN LIMITATION: the extra lane-transit cost genuinely varies a lot
+    by track (Monaco's pit lane costs far more than Spa's), and OpenF1
+    doesn't expose it directly. 8s is a conservative, track-agnostic
+    estimate (real values range roughly 5-12s at most circuits, with
+    outliers like Monaco much higher) — it will under-estimate total pit
+    loss at long-pit-lane tracks. If you want per-track accuracy, look up
+    the circuit's real pit lane loss (widely published after each race)
+    and pass it in instead of relying on this default.
     """
-    LANE_TRANSIT_ESTIMATE_SEC = 20.0  # rough, track-independent estimate
+    LANE_TRANSIT_ESTIMATE_SEC = 8.0
 
     if pits_df.empty or "pit_duration" not in pits_df.columns:
         return 22.0 + LANE_TRANSIT_ESTIMATE_SEC
@@ -49,37 +56,157 @@ def compute_pit_loss(pits_df: pd.DataFrame) -> float:
 # Degradation model (linear, per compound)
 # --------------------------------------------------------------------------
 
-def fit_degradation_models(laps_with_tires: pd.DataFrame) -> dict:
-    """
-    Fits LapTime = base_time + deg_rate * tire_age per compound, using
-    ordinary linear regression (np.polyfit, degree 1).
+# Used only when a joint fit isn't possible (fewer than 2 compounds with
+# real data this race — can't separate compound identity from session
+# progress with just one compound). Same rough literature estimate as
+# before, now clearly labeled as the degraded fallback path, not the norm.
+DEFAULT_PROGRESS_SLOPE = -0.05
 
-    tire_age == 0 laps are dropped before fitting — that row is either the
-    standing-start lap (pack bunching, no DRS trains yet) or a pit out-lap,
-    both artificially slow for reasons unrelated to tire wear.
+
+def fit_joint_race_model(laps_with_tires: pd.DataFrame, min_laps_per_compound: int = 5) -> dict | None:
+    """
+    Jointly fits, in a SINGLE least-squares solve across ALL compounds with
+    enough data in one race:
+
+        lap_duration = base_time[compound] + deg_rate[compound] * tire_age
+                        + progress_slope * lap_number
+
+    progress_slope is SHARED across every compound and captures the
+    combined effect of fuel burning off AND track evolution (rubber going
+    down) — both cause "laps get faster as the race goes on," regardless
+    of which tire is fitted. Estimating it from real data (instead of
+    assuming a fixed constant) is what actually removes the confound: a
+    fixed guess of e.g. 0.05s/lap isn't enough to correct for the fact that
+    SOFT stints run early (heavy fuel, low track evolution) and HARD
+    stints run late (light fuel, high track evolution) in nearly every
+    race — a systematic pattern that persists even after averaging across
+    many races, since it's not random noise.
+
+    Returns None if fewer than 2 compounds have >= min_laps_per_compound
+    real laps (can't jointly separate compound pace from session
+    progress with only one compound), or if the design matrix is
+    degenerate. Caller should fall back to the simpler per-compound fit.
+    """
+    if laps_with_tires.empty or "lap_number" not in laps_with_tires.columns:
+        return None
+
+    df = laps_with_tires[laps_with_tires["tire_age"] > 0].dropna(subset=["compound", "lap_duration", "lap_number"])
+    counts = df["compound"].value_counts()
+    usable = sorted(counts[counts >= min_laps_per_compound].index.tolist())
+    if len(usable) < 2:
+        return None
+    df = df[df["compound"].isin(usable)]
+
+    n_c = len(usable)
+    intercept_cols = [(df["compound"] == c).astype(float).to_numpy() for c in usable]
+    age_cols = [((df["compound"] == c).astype(float) * df["tire_age"]).to_numpy() for c in usable]
+    lap_num_col = df["lap_number"].to_numpy(dtype=float)
+
+    X = np.column_stack(intercept_cols + age_cols + [lap_num_col])
+    y = df["lap_duration"].to_numpy(dtype=float)
+
+    if np.linalg.matrix_rank(X) < X.shape[1]:
+        return None  # degenerate design, bail to fallback
+
+    coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
+    base_times = coeffs[:n_c]
+    deg_rates = coeffs[n_c:2 * n_c]
+    progress_slope = float(coeffs[-1])
+
+    result = {"_progress_slope": progress_slope}
+    for i, c in enumerate(usable):
+        slope = float(deg_rates[i])
+        if slope < 0:
+            slope = 0.01  # residual noise outweighed wear in-sample; clip to keep sim sane
+        result[c] = {
+            "base_time": float(base_times[i]),
+            "deg_rate": slope,
+            "lap_count": int(counts[c]),
+        }
+    return result
+
+
+def fit_degradation_models(laps_with_tires: pd.DataFrame, season_priors: dict | None = None) -> dict:
+    """
+    Fits per-compound tire pace using fit_joint_race_model() when possible
+    (>=2 compounds with real data this race, so session-progress effects
+    can be separated from compound identity — see that function's
+    docstring for why this matters). Falls back to independent
+    per-compound fits with DEFAULT_PROGRESS_SLOPE when only one (or zero)
+    compounds have real local data.
+
+    season_priors (optional): output of season_priors.compute_season_priors().
+    Used ONLY for compounds with no real local data this race. Estimates
+    that compound's pace as this race's real MEDIUM pace + the compound's
+    typical season-wide offset from MEDIUM (itself computed via the same
+    joint-fit approach, race by race, before averaging). Falls back to a
+    crude fastest-lap-anchored estimate if no season_priors are supplied
+    or the compound isn't in them — that fallback is flagged
+    'global_fallback' and excluded from the optimizer's search.
+
+    Each model carries 'data_source': 'race_fit' | 'season_prior' | 'global_fallback'.
     """
     models = {}
-    compounds = laps_with_tires["compound"].dropna().unique() if not laps_with_tires.empty else []
+    progress_slope = DEFAULT_PROGRESS_SLOPE
+
+    joint = fit_joint_race_model(laps_with_tires)
+    if joint is not None:
+        progress_slope = joint.pop("_progress_slope")
+        for comp, fit in joint.items():
+            models[comp] = {
+                **fit, "progress_slope": progress_slope,
+                "has_real_data": True, "data_source": "race_fit",
+            }
+    else:
+        # Fallback: independent per-compound fit, assuming DEFAULT_PROGRESS_SLOPE.
+        # Less trustworthy — only hit when this race doesn't have enough
+        # compound variety to jointly estimate session progress.
+        compounds = laps_with_tires["compound"].dropna().unique() if not laps_with_tires.empty else []
+        for comp in compounds:
+            df_comp = laps_with_tires[laps_with_tires["compound"] == comp]
+            df_comp = df_comp[df_comp["tire_age"] > 0]
+            if len(df_comp) < 5:
+                continue
+            adjusted = df_comp["lap_duration"] - progress_slope * df_comp["lap_number"]
+            slope, intercept = np.polyfit(df_comp["tire_age"], adjusted, 1)
+            if slope < 0:
+                slope = 0.01
+            models[comp] = {
+                "base_time": float(intercept), "deg_rate": float(slope), "progress_slope": progress_slope,
+                "has_real_data": True, "lap_count": int(len(df_comp)), "data_source": "race_fit",
+            }
+
     global_q1 = float(laps_with_tires["lap_duration"].quantile(0.1)) if not laps_with_tires.empty else 90.0
-
-    for comp in compounds:
-        df_comp = laps_with_tires[laps_with_tires["compound"] == comp]
-        df_comp = df_comp[df_comp["tire_age"] > 0]
-        if len(df_comp) < 5:
-            continue
-        slope, intercept = np.polyfit(df_comp["tire_age"], df_comp["lap_duration"], 1)
-        if slope < 0:
-            slope = 0.01  # track evolution/fuel burn outweighed wear in-sample; clip to keep sim sane
-        models[comp] = {"base_time": float(intercept), "deg_rate": float(slope)}
-
-    # Fallback profiles for compounds that didn't run (e.g. no rain -> no WET data)
-    fallback_defaults = {
+    fallback_default_slopes = {
         "SOFT": 0.12, "MEDIUM": 0.08, "HARD": 0.05,
         "INTERMEDIATE": 0.06, "WET": 0.04,
     }
-    for comp, default_slope in fallback_defaults.items():
-        if comp not in models:
-            models[comp] = {"base_time": global_q1, "deg_rate": default_slope}
+    medium_base = models.get("MEDIUM", {}).get("base_time")
+
+    for comp, default_slope in fallback_default_slopes.items():
+        if comp in models:
+            continue
+
+        offset = None
+        prior_slope = None
+        if season_priors and comp in season_priors.get("relative_offset_vs_medium", {}):
+            offset = season_priors["relative_offset_vs_medium"][comp]
+            prior_slope = season_priors.get("avg_deg_rate", {}).get(comp)
+
+        if offset is not None and medium_base is not None:
+            models[comp] = {
+                "base_time": medium_base + offset,
+                "deg_rate": float(prior_slope) if prior_slope else default_slope,
+                "progress_slope": progress_slope,
+                "has_real_data": False, "lap_count": 0,
+                "data_source": "season_prior",
+            }
+        else:
+            models[comp] = {
+                "base_time": global_q1, "deg_rate": float(default_slope), "progress_slope": progress_slope,
+                "has_real_data": False, "lap_count": 0,
+                "data_source": "global_fallback",
+            }
 
     return models
 
@@ -150,12 +277,17 @@ def simulate_strategy(
     """
     strategy: e.g. [('MEDIUM', 20), ('HARD', 52)] = Medium laps 1-20, Hard 21-52.
 
-    Adds a wrong-tire-for-conditions penalty per lap using real weather data:
-    slicks (SOFT/MEDIUM/HARD) on a wet lap, or wets/inters on a dry lap,
-    each cost WRONG_TIRE_PENALTY_SEC extra — this is what lets the optimizer
-    actually choose intermediates during rain instead of ignoring weather.
+    Predicted lap time = base_time + deg_rate*age + progress_slope*lap_number,
+    matching exactly the model fit_degradation_models() fit (joint
+    regression when possible — see fit_joint_race_model docstring for why
+    progress_slope is estimated from data rather than assumed).
 
-    Known scope cut: ignores safety cars and in-race fuel burn.
+    Also adds a wrong-tire-for-conditions penalty per lap using real weather
+    data: slicks on a wet lap, or wets/inters on a dry lap, each cost
+    WRONG_TIRE_PENALTY_SEC extra — this is what lets the optimizer actually
+    choose intermediates during rain instead of ignoring weather.
+
+    Known scope cut: ignores safety cars and traffic/dirty air.
     """
     lap_weather = lap_weather or {}
     total_time = (len(strategy) - 1) * pit_loss
@@ -167,6 +299,7 @@ def simulate_strategy(
         for age in range(1, stint_laps + 1):
             lap_num = current_lap + age - 1
             lap_time = model["base_time"] + model["deg_rate"] * age
+            lap_time += model.get("progress_slope", DEFAULT_PROGRESS_SLOPE) * lap_num
 
             wet = is_wet_lap(lap_num, lap_weather)
             if wet and compound in DRY_COMPOUNDS:
@@ -192,14 +325,32 @@ def optimize_strategy(
     wet-weather tires so the optimizer can actually pick them when
     lap_weather shows rain. The "must use 2 different compounds" FIA rule
     is only enforced for fully dry races (rain races are exempt in reality).
+
+    IMPORTANT: only searches compounds with data_source in
+    ('race_fit', 'season_prior') — i.e. compounds backed by either real
+    laps this race, or a season-wide relative-pace prior anchored to this
+    race's own MEDIUM pace. 'global_fallback' compounds (no local data AND
+    no season prior available) are excluded, since their pace estimate is
+    untrustworthy (anchored to this race's fastest lap overall, which can
+    make e.g. an unused WET tire look as fast as a well-used HARD tire).
+    If every compound is global_fallback (degenerate case, e.g. testing on
+    a tiny synthetic dataset), falls back to searching everything so the
+    function never returns an empty result.
     """
     lap_weather = lap_weather or {}
     wet_race = race_has_rain(lap_weather)
     best_time, best_strategy = float("inf"), None
 
+    usable_compounds = [
+        c for c in ALL_COMPOUNDS
+        if models.get(c, {}).get("data_source") in ("race_fit", "season_prior")
+    ]
+    if not usable_compounds:
+        usable_compounds = list(ALL_COMPOUNDS)
+
     # 1-stop
-    for c1 in ALL_COMPOUNDS:
-        for c2 in ALL_COMPOUNDS:
+    for c1 in usable_compounds:
+        for c2 in usable_compounds:
             if c1 == c2 and not wet_race:
                 continue
             for pit1 in range(5, total_laps - 5):
@@ -209,9 +360,9 @@ def optimize_strategy(
                     best_time, best_strategy = t, strat
 
     # 2-stop
-    for c1 in ALL_COMPOUNDS:
-        for c2 in ALL_COMPOUNDS:
-            for c3 in ALL_COMPOUNDS:
+    for c1 in usable_compounds:
+        for c2 in usable_compounds:
+            for c3 in usable_compounds:
                 if len(set([c1, c2, c3])) < 2 and not wet_race:
                     continue
                 for pit1 in range(5, total_laps - 10):
@@ -268,12 +419,17 @@ def format_strategy(strategy: list) -> str:
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import json
+    import os
+
     parser = argparse.ArgumentParser(description="F1 Strategy Optimizer")
     parser.add_argument("--year", type=int, required=True)
     parser.add_argument("--country", type=str, required=True)
     parser.add_argument("--drivers", type=int, nargs="*", default=None,
                          help="Driver numbers to compare, e.g. --drivers 1 44 16. "
                               "Defaults to the first 5 drivers found.")
+    parser.add_argument("--no-season-priors", action="store_true",
+                         help="Ignore data/season_priors_<year>.json even if it exists.")
     args = parser.parse_args()
 
     race = load_race(args.year, args.country)
@@ -290,10 +446,27 @@ if __name__ == "__main__":
     print(f"Weather data mapped for {len(lap_weather)} laps")
     print(f"Rain detected during this race: {race_has_rain(lap_weather)}\n")
 
+    season_priors = None
+    priors_path = os.path.join("data", f"season_priors_{args.year}.json")
+    if not args.no_season_priors and os.path.exists(priors_path):
+        with open(priors_path) as f:
+            season_priors = json.load(f)
+        print(f"Loaded season priors from {priors_path}\n")
+    else:
+        print(f"No season priors found at {priors_path} "
+              f"(run season_priors.py to build one) - untested compounds will "
+              f"be excluded from the optimizer instead of estimated.\n")
+
     print("Fitting tire degradation profiles...")
-    models = fit_degradation_models(laps_with_tires)
+    models = fit_degradation_models(laps_with_tires, season_priors=season_priors)
     for comp, stats in models.items():
-        print(f"  {comp}: Base Pace = {stats['base_time']:.2f}s | Deg Rate = +{stats['deg_rate']:.3f}s/lap")
+        if stats["data_source"] == "race_fit":
+            source = f"{stats['lap_count']} real laps this race"
+        elif stats["data_source"] == "season_prior":
+            source = "season prior (no local data)"
+        else:
+            source = "NO DATA - excluded from optimizer"
+        print(f"  {comp}: Base Pace = {stats['base_time']:.2f}s | Deg Rate = +{stats['deg_rate']:.3f}s/lap | ({source})")
 
     print("\nRunning strategy simulation (brute-forcing combinations)...")
     result = optimize_strategy(total_laps, models, pit_loss, lap_weather)
