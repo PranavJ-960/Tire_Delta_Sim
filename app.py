@@ -20,11 +20,13 @@ from optimizer import (
     fit_degradation_models,
     optimize_strategy,
     compare_driver_to_optimal,
+    reconstruct_actual_strategy,
     format_strategy,
     DRY_COMPOUNDS,
     WET_COMPOUNDS,
 )
 from season_priors import load_season_priors
+from monte_carlo import run_monte_carlo, SAFETY_CAR_PROBABILITY
 
 st.set_page_config(page_title="F1 Pit Strategy Simulator", layout="wide")
 st.title("🏎️ F1 Pit Strategy Simulator")
@@ -151,8 +153,70 @@ with right:
     else:
         st.write("No stint data available for this race.")
 
+st.markdown("---")
+st.subheader("🎲 Monte Carlo: How Often Does Each Strategy Actually Win?")
+st.caption(
+    "Instead of a single deterministic answer, runs each candidate through "
+    "many randomized trials — real per-lap noise from each compound's own "
+    "fitted scatter, plus a simple random-safety-car model — and reports "
+    "how often each one actually comes out fastest."
+)
+
+available_drivers = sorted(race["stints"]["driver_number"].unique())
+mc_drivers = st.multiselect(
+    "Include these drivers' real strategies as candidates",
+    available_drivers, default=available_drivers[:3],
+)
+n_trials = st.slider("Number of trials", 500, 5000, 2000, step=500)
+
+if st.button("Run Monte Carlo Comparison"):
+    candidates = {}
+    if optimal["by_stop_count"][1]["strategy"]:
+        candidates["Optimal 1-stop"] = optimal["by_stop_count"][1]["strategy"]
+    if optimal["by_stop_count"][2]["strategy"]:
+        candidates["Optimal 2-stop"] = optimal["by_stop_count"][2]["strategy"]
+    for dn in mc_drivers:
+        strat = reconstruct_actual_strategy(race["stints"], dn)
+        if strat:
+            candidates[f"Driver #{dn} actual"] = strat
+
+    with st.spinner(f"Running {n_trials} trials per candidate..."):
+        mc_results = run_monte_carlo(candidates, total_laps, models, pit_loss, lap_weather, n_trials=n_trials)
+
+    sorted_results = sorted(mc_results.items(), key=lambda kv: -kv[1]["win_pct"])
+
+    mc_left, mc_right = st.columns([1, 1])
+    with mc_left:
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        labels = [label for label, _ in sorted_results]
+        win_pcts = [r["win_pct"] for _, r in sorted_results]
+        ax.barh(labels[::-1], win_pcts[::-1], color="#e10600")
+        ax.set_xlabel("Win rate (%)")
+        ax.set_xlim(0, 100)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    with mc_right:
+        table_rows = [{
+            "Strategy": label,
+            "Win Rate": f"{r['win_pct']:.1f}%",
+            "Median Time": f"{r['median_min']:.2f} min",
+            "P10-P90": f"{r['p10_min']:.2f}-{r['p90_min']:.2f} min",
+        } for label, r in sorted_results]
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
+
+    st.caption(
+        f"Safety car probability per trial: {SAFETY_CAR_PROBABILITY:.0%} (documented "
+        "estimate, not fitted). Candidates share the same random draws per trial, "
+        "so differences reflect genuine strategy gaps, not lucky random numbers."
+    )
+
+st.markdown("---")
 st.caption(
     "Model scope: linear tire degradation per compound, real weather-based "
-    "wrong-tire penalties, fixed pit-lane loss. Ignores safety cars, VSC, "
-    "and traffic — see README for details."
+    "wrong-tire penalties, fixed pit-lane loss. The strategy above ignores "
+    "safety cars and traffic; the Monte Carlo section adds a simplified "
+    "random safety car model, but track position/traffic are still not "
+    "modeled anywhere on this page — see README for details."
 )

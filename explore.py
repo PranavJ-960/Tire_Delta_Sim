@@ -11,13 +11,28 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
+def _read_csv_or_empty(path: str) -> pd.DataFrame:
+    """
+    A DataFrame with zero rows/columns saves as a truly empty CSV file (no
+    header at all), which pd.read_csv rejects with EmptyDataError instead
+    of just returning an empty table. Happens in practice when OpenF1's
+    pit endpoint 404s for a session (data_pipeline.py saves an empty
+    pits DataFrame in that case) — this is a legitimate "no data" case,
+    not a corrupt file, so it's handled here rather than left to crash.
+    """
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
 def load_race(year: int, country: str, data_dir: str = "data") -> dict:
     race_dir = os.path.join(data_dir, f"{year}_{country.replace(' ', '_')}")
     return {
-        "laps": pd.read_csv(os.path.join(race_dir, "laps.csv")),
-        "stints": pd.read_csv(os.path.join(race_dir, "stints.csv")),
-        "pits": pd.read_csv(os.path.join(race_dir, "pit_stops.csv")),
-        "weather": pd.read_csv(os.path.join(race_dir, "weather.csv")),
+        "laps": _read_csv_or_empty(os.path.join(race_dir, "laps.csv")),
+        "stints": _read_csv_or_empty(os.path.join(race_dir, "stints.csv")),
+        "pits": _read_csv_or_empty(os.path.join(race_dir, "pit_stops.csv")),
+        "weather": _read_csv_or_empty(os.path.join(race_dir, "weather.csv")),
     }
 
 

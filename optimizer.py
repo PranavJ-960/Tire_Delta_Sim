@@ -62,6 +62,11 @@ def compute_pit_loss(pits_df: pd.DataFrame) -> float:
 # before, now clearly labeled as the degraded fallback path, not the norm.
 DEFAULT_PROGRESS_SLOPE = -0.05
 
+# Typical per-lap noise (driver variability, traffic, small track changes)
+# when a compound's own residual std can't be computed (e.g. season_prior/
+# global_fallback compounds with no real local laps). Used by monte_carlo.py.
+DEFAULT_RESIDUAL_STD = 0.35
+
 
 def fit_joint_race_model(laps_with_tires: pd.DataFrame, min_laps_per_compound: int = 5) -> dict | None:
     """
@@ -113,15 +118,20 @@ def fit_joint_race_model(laps_with_tires: pd.DataFrame, min_laps_per_compound: i
     deg_rates = coeffs[n_c:2 * n_c]
     progress_slope = float(coeffs[-1])
 
+    residuals = y - X @ coeffs  # actual - predicted, per lap
+
     result = {"_progress_slope": progress_slope}
     for i, c in enumerate(usable):
         slope = float(deg_rates[i])
         if slope < 0:
             slope = 0.01  # residual noise outweighed wear in-sample; clip to keep sim sane
+        comp_mask = (df["compound"] == c).to_numpy()
+        comp_residual_std = float(np.std(residuals[comp_mask])) if comp_mask.sum() > 1 else DEFAULT_RESIDUAL_STD
         result[c] = {
             "base_time": float(base_times[i]),
             "deg_rate": slope,
             "lap_count": int(counts[c]),
+            "residual_std": comp_residual_std,
         }
     return result
 
@@ -171,9 +181,12 @@ def fit_degradation_models(laps_with_tires: pd.DataFrame, season_priors: dict | 
             slope, intercept = np.polyfit(df_comp["tire_age"], adjusted, 1)
             if slope < 0:
                 slope = 0.01
+            predicted = intercept + slope * df_comp["tire_age"]
+            residual_std = float((adjusted - predicted).std()) if len(df_comp) > 1 else DEFAULT_RESIDUAL_STD
             models[comp] = {
                 "base_time": float(intercept), "deg_rate": float(slope), "progress_slope": progress_slope,
                 "has_real_data": True, "lap_count": int(len(df_comp)), "data_source": "race_fit",
+                "residual_std": residual_std,
             }
 
     global_q1 = float(laps_with_tires["lap_duration"].quantile(0.1)) if not laps_with_tires.empty else 90.0
@@ -200,12 +213,14 @@ def fit_degradation_models(laps_with_tires: pd.DataFrame, season_priors: dict | 
                 "progress_slope": progress_slope,
                 "has_real_data": False, "lap_count": 0,
                 "data_source": "season_prior",
+                "residual_std": DEFAULT_RESIDUAL_STD,
             }
         else:
             models[comp] = {
                 "base_time": global_q1, "deg_rate": float(default_slope), "progress_slope": progress_slope,
                 "has_real_data": False, "lap_count": 0,
                 "data_source": "global_fallback",
+                "residual_std": DEFAULT_RESIDUAL_STD,
             }
 
     return models
@@ -317,38 +332,21 @@ def simulate_strategy(
 # Optimizer
 # --------------------------------------------------------------------------
 
-def optimize_strategy(
-    total_laps: int, models: dict, pit_loss: float, lap_weather: dict | None = None,
-) -> dict:
-    """
-    Brute-forces 1-stop and 2-stop combinations. Compound universe includes
-    wet-weather tires so the optimizer can actually pick them when
-    lap_weather shows rain. The "must use 2 different compounds" FIA rule
-    is only enforced for fully dry races (rain races are exempt in reality).
-
-    IMPORTANT: only searches compounds with data_source in
-    ('race_fit', 'season_prior') — i.e. compounds backed by either real
-    laps this race, or a season-wide relative-pace prior anchored to this
-    race's own MEDIUM pace. 'global_fallback' compounds (no local data AND
-    no season prior available) are excluded, since their pace estimate is
-    untrustworthy (anchored to this race's fastest lap overall, which can
-    make e.g. an unused WET tire look as fast as a well-used HARD tire).
-    If every compound is global_fallback (degenerate case, e.g. testing on
-    a tiny synthetic dataset), falls back to searching everything so the
-    function never returns an empty result.
-    """
-    lap_weather = lap_weather or {}
-    wet_race = race_has_rain(lap_weather)
-    best_time, best_strategy = float("inf"), None
-
-    usable_compounds = [
+def _get_usable_compounds(models: dict) -> list:
+    usable = [
         c for c in ALL_COMPOUNDS
         if models.get(c, {}).get("data_source") in ("race_fit", "season_prior")
     ]
-    if not usable_compounds:
-        usable_compounds = list(ALL_COMPOUNDS)
+    return usable if usable else list(ALL_COMPOUNDS)
 
-    # 1-stop
+
+def optimize_one_stop(total_laps: int, models: dict, pit_loss: float, lap_weather: dict | None = None) -> dict:
+    """Best 1-stop strategy only. See optimize_strategy for shared details."""
+    lap_weather = lap_weather or {}
+    wet_race = race_has_rain(lap_weather)
+    usable_compounds = _get_usable_compounds(models)
+    best_time, best_strategy = float("inf"), None
+
     for c1 in usable_compounds:
         for c2 in usable_compounds:
             if c1 == c2 and not wet_race:
@@ -359,7 +357,16 @@ def optimize_strategy(
                 if t < best_time:
                     best_time, best_strategy = t, strat
 
-    # 2-stop
+    return {"strategy": best_strategy, "total_time": best_time}
+
+
+def optimize_two_stop(total_laps: int, models: dict, pit_loss: float, lap_weather: dict | None = None) -> dict:
+    """Best 2-stop strategy only. See optimize_strategy for shared details."""
+    lap_weather = lap_weather or {}
+    wet_race = race_has_rain(lap_weather)
+    usable_compounds = _get_usable_compounds(models)
+    best_time, best_strategy = float("inf"), None
+
     for c1 in usable_compounds:
         for c2 in usable_compounds:
             for c3 in usable_compounds:
@@ -372,7 +379,42 @@ def optimize_strategy(
                         if t < best_time:
                             best_time, best_strategy = t, strat
 
-    return {"strategy": best_strategy, "total_time": best_time, "wet_race": wet_race}
+    return {"strategy": best_strategy, "total_time": best_time}
+
+
+def optimize_strategy(
+    total_laps: int, models: dict, pit_loss: float, lap_weather: dict | None = None,
+) -> dict:
+    """
+    Brute-forces 1-stop and 2-stop combinations and returns the overall
+    best, plus each stop-count's own best under 'by_stop_count' — useful
+    as distinct candidates for monte_carlo.py rather than only a single
+    global answer. Compound universe includes wet-weather tires so the
+    optimizer can actually pick them when lap_weather shows rain. The
+    "must use 2 different compounds" FIA rule is only enforced for fully
+    dry races (rain races are exempt in reality).
+
+    IMPORTANT: only searches compounds with data_source in
+    ('race_fit', 'season_prior') — i.e. compounds backed by either real
+    laps this race, or a season-wide relative-pace prior anchored to this
+    race's own MEDIUM pace. 'global_fallback' compounds (no local data AND
+    no season prior available) are excluded, since their pace estimate is
+    untrustworthy. If every compound is global_fallback (degenerate case,
+    e.g. testing on a tiny synthetic dataset), falls back to searching
+    everything so the function never returns an empty result.
+    """
+    one_stop = optimize_one_stop(total_laps, models, pit_loss, lap_weather)
+    two_stop = optimize_two_stop(total_laps, models, pit_loss, lap_weather)
+
+    candidates = [c for c in (one_stop, two_stop) if c["strategy"] is not None]
+    best = min(candidates, key=lambda c: c["total_time"]) if candidates else {"strategy": None, "total_time": float("inf")}
+
+    return {
+        "strategy": best["strategy"],
+        "total_time": best["total_time"],
+        "wet_race": race_has_rain(lap_weather or {}),
+        "by_stop_count": {1: one_stop, 2: two_stop},
+    }
 
 
 # --------------------------------------------------------------------------
